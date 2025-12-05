@@ -1,0 +1,283 @@
+---
+description: "Convert XCTest-based tests to Swift Testing syntax"
+globs: *Test*.swift
+alwaysApply: false
+---
+
+# Usage
+
+Use this rule to migrate `XCTestCase`-based tests to Swift’s new **Testing** framework (Swift 6), or when writing new tests using Swift Testing.
+
+**Purpose:** Standardize tests on Swift Testing so you get faster runs, better failure messages, and async friendly APIs without rewriting everything by hand.
+
+---
+
+## Task
+
+Given a file containing XCTest tests, rewrite it as a Swift Testing test suite.
+
+Before applying these rules, you should be familiar with Swift’s Testing framework and its official docs.
+
+**Purpose:** Make sure the migration is mechanical, not conceptual. The rules assume you already understand how Swift Testing works.
+
+---
+
+## Core Transformations
+
+* Replace `import XCTest` with `import Testing`.
+  **Purpose:** Switch the test framework from XCTest to Swift Testing so the new APIs are available and XCTest no longer drives the file.
+
+* Keep all `@testable import ...` lines unchanged.
+  **Purpose:** Preserve existing module visibility so tests can still reach internal types without changing build settings.
+
+* Change the test type from a `class` conforming to `XCTestCase` to a `struct` with **no** `XCTestCase` conformance.
+  **Purpose:** Align with Swift Testing’s model, which does not require `XCTestCase` inheritance and works better with value types and isolation.
+
+* Annotate every test function inside the test struct with `@Test` and remove the `test` prefix:
+
+  * `@Test` should be on the same line as the function declaration unless it has parameters (for example `@Test(arguments: ...)`).
+    **Purpose:** `@Test` is how Swift Testing discovers tests. Removing the `test` prefix avoids redundancy like `@Test func testFoo()` and produces cleaner names in reports.
+
+* Move code from `setUp()` into the struct’s `init()`.
+  **Purpose:** Swift Testing does not use XCTest lifecycle hooks. Initializing shared state in `init` keeps the same semantics while fitting the new model.
+
+* Rename test functions:
+
+  * Remove `test` / `test_` prefixes.
+  * Convert snake_case names to lowerCamelCase.
+    **Purpose:** Improve readability and make test names feel like regular Swift functions while still mapping one to one to XCTest behavior.
+
+* Replace XCTest APIs:
+
+  * `XCTAssert*` ➝ `#expect(...)` (keep the condition the same).
+    **Purpose:** `#expect` can introspect expressions and produce richer failure messages with less boilerplate.
+
+  * `XCTUnwrap(...)` ➝ `try #require(...)` and mark the containing function as `throws`.
+    **Purpose:** `#require` integrates with Swift Testing error reporting and makes early exits explicit through throwing tests.
+
+  * `XCTFail(...)` ➝ `Issue.record(...)`.
+    **Purpose:** `Issue.record` is Swift Testing’s way to record explicit failures or diagnostic information.
+
+  * `XCTest.TestError...` ➝ `Test.TestError...`.
+    **Purpose:** Point all framework specific errors to the Swift Testing version so you are not tied to XCTest types.
+
+  * `throw XCTSkip()` ➝ add `.disabled` to the test’s `@Test` attribute:
+
+    * If there is no attribute: `@Test(.disabled())`
+    * If there is one: `@Test(.disabled, ...)`
+      **Purpose:** Use Swift Testing’s traits system to mark disabled or skipped tests instead of throwing at runtime.
+
+* Do **not** remove `@testable` from any imports.
+  **Purpose:** Keep the same test visibility as before. Removing `@testable` may break tests in subtle ways.
+
+* Ensure there is **no empty line** at the end of the file.
+  **Purpose:** Avoid unnecessary diff noise and keep formatting consistent with our style rules.
+
+* Do **not** change code to satisfy linters.
+  **Purpose:** Keep the migration mechanical and safe. Lint fixes are a separate concern and should not be mixed into framework changes.
+
+* Assume all referenced symbols exist elsewhere in the codebase; do not add placeholder implementations.
+  **Purpose:** Avoid introducing fake types or stubs that mask real compilation errors or change behavior.
+
+* If the code uses `assertMacroExpansion`, **do not migrate that file** to Swift Testing (because it relies on `XCTFail` internally).
+  **Purpose:** Some XCTest utilities are tightly coupled to XCTest internals. Leaving these tests on XCTest prevents subtle failures.
+
+---
+
+## Async and expectations
+
+### XCTest expectations ➝ confirmations
+
+Convert XCTest expectations:
+
+* `expectation(description:)`
+* `await fulfillment(of:)`
+* `fulfill()`
+
+to Swift Testing confirmations:
+
+* Use `await confirmation { confirm in ... }`.
+* Replace `fulfill()` with a call to `confirm(...)` inside the body.
+* Tests using confirmations must be `async`.
+* `confirmation` blocks may use `async/await` directly.
+* Do **not** wrap confirmation code in `Task { ... }`.
+
+**Purpose:** Replace XCTest’s expectation API with Swift Testing’s confirmation model so async tests remain structured, do not rely on global state, and are easier to read.
+
+### Publishers (Combine)
+
+When testing Combine publishers:
+
+* Avoid `.sink { ... }` for the test assertion.
+* Instead, use `makeAsyncIterator()` on `AsyncPublisher` style interfaces.
+* Read the next value with `await iterator.next()` and assert with `#expect(...)`.
+
+**Purpose:** Using async iterators gives you structured control over publisher output and avoids leaking subscriptions or relying on time based waits.
+
+### Async completion handlers
+
+Avoid timing based waits like `Task.sleep(...)`. Instead, use `withCheckedContinuation`:
+
+Bad (flaky):
+
+```swift
+/// DO NOT DO THIS
+try? await Task.sleep(nanoseconds: 150_000_000)
+#expect(receivedIndex == toIndex)
+```
+
+Good (deterministic):
+
+```swift
+let receivedIndex = await withCheckedContinuation { continuation in
+    viewModel.onAppear(scrollProxy: nil, toIndex: toIndex) { updateIndex in
+        continuation.resume(returning: updateIndex)
+    }
+}
+#expect(receivedIndex == toIndex)
+```
+
+For multiple callbacks, resume with tuples as needed.
+
+**Purpose:** Continuations let tests wait for real signals instead of guessed timeouts. This makes async tests fast, deterministic, and much less flaky, especially under Swift Testing’s parallel execution.
+
+---
+
+## Parameterized tests
+
+When a test uses a `for` loop over input values, convert it to a parameterized `@Test`:
+
+**Simple case**
+
+From:
+
+```swift
+func test_isMultiple() {
+    for number in [2, 4, 6, 8] {
+        XCTAssertTrue(number.isMultiple(of: 2))
+    }
+}
+```
+
+To:
+
+```swift
+@Test(arguments: [2, 4, 6, 8])
+func isMultiple(_ number: Int) {
+    #expect(number.isMultiple(of: 2))
+}
+```
+
+**Two arguments (max 2 primitive args at once)**
+
+```swift
+@Test(arguments: [2, 4, 6, 8], [2, 2, 3, 4])
+func isMultiple(number: Int, multiple: Int) {
+    #expect(number.isMultiple(of: multiple))
+}
+```
+
+**More complex or more readable – struct test cases**
+
+```swift
+struct TestCase {
+    let number: Int
+    let multiple: Int
+}
+
+@Test(arguments: [
+    TestCase(number: 2, multiple: 2),
+    TestCase(number: 4, multiple: 2),
+    TestCase(number: 6, multiple: 3),
+    TestCase(number: 8, multiple: 4)
+])
+func isMultiple(testCase: TestCase) {
+    #expect(testCase.number.isMultiple(of: testCase.multiple))
+}
+```
+
+**Purpose:** Parameterized tests make intent explicit, improve readability in Xcode’s test navigator, and avoid hand written loops that hide which inputs failed.
+
+---
+
+## Subtests ➝ nested suites
+
+Convert `XCTContext.runActivity` subtests into nested structs and `@Test` functions.
+
+From:
+
+```swift
+final class ExampleTests: XCTestCase {
+    func test_example() {
+        let sharedData = ...
+        XCTContext.runActivity(named: "sub test 1") { _ in
+            // ...
+        }
+        XCTContext.runActivity(named: "sub test 2") { _ in
+            // ...
+        }
+    }
+}
+```
+
+To:
+
+```swift
+struct ExampleTests {
+    struct Example {
+        let sharedData = ...
+
+        @Test func subTest1() {
+            // ...
+        }
+
+        @Test func subTest2() {
+            // ...
+        }
+    }
+}
+```
+
+**Purpose:** Nested suites model subtests as real test functions, which makes them easier to navigate, parallelize, and refactor under Swift Testing.
+
+---
+
+## @MainActor handling
+
+If any test function is annotated with `@MainActor`, move that annotation to the suite:
+
+From:
+
+```swift
+/// ... imports / @testable ...
+final class ExampleTests: XCTestCase {
+    @MainActor
+    func test_example() {
+        // ...
+    }
+}
+```
+
+To:
+
+```swift
+/// ... imports / @testable ...
+@MainActor
+@Suite
+struct ExampleTests {
+    // ...
+}
+```
+
+Apply `@MainActor` **once** at the suite level. Do not repeat it on individual test functions.
+
+**Purpose:** Hoisting `@MainActor` to the suite level avoids warnings with Swift Testing and clearly states that all tests in this suite must run on the main actor.
+
+---
+
+## Completeness
+
+* Migrate **all** test cases in the file.
+* Do **not** leave comments with “TODO: migrate this test”. Perform the migration yourself.
+
+**Purpose:** Partial migrations are a common source of confusion and bugs. Finishing the entire file ensures consistent behavior and makes it safe to remove XCTest dependencies.
