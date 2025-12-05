@@ -28,8 +28,8 @@ jobs:
           # Build the app
           bazelisk build -- //app
 
-          # Run the tests
-          bazelisk test --local_test_jobs=1 -- //...
+          # Run the tests with increased timeout for simulator boot
+          bazelisk test --test_timeout=600 --local_test_jobs=1 -- //...
       - name: Generate Xcode Project
         run: |
           # Generate Xcode project
