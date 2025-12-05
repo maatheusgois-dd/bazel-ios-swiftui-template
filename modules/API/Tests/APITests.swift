@@ -1,8 +1,8 @@
 import API
-import XCTest
+import Testing
 
-final class APITests: XCTestCase {
-    func test_success() {
-        XCTAssertTrue(API.returnTrue())
+struct APITests {
+    @Test func success() {
+        #expect(API.returnTrue())
     }
 }
